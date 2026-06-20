@@ -1610,6 +1610,12 @@ button:active {
   gap: 12px;
 }
 
+.detail-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
 .detail-sheet h2 {
   font-family: var(--display-font);
   font-size: 20px;
@@ -1627,13 +1633,24 @@ button:active {
   font-weight: 400;
 }
 
-.detail-title-row button {
+.detail-actions button {
   min-width: 52px;
   height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   padding: 0 12px;
   border-radius: 999px;
   color: #ffffff;
   background: #2f6b4f;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.detail-actions button:first-child {
+  color: #8a5a00;
+  background: rgba(255, 212, 90, 0.28);
 }
 
 .asset-status {

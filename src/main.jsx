@@ -10,6 +10,7 @@ import {
   Heart,
   Pencil,
   Search,
+  Share2,
   Trash2,
   Upload,
   UserCircle,
@@ -173,12 +174,53 @@ async function extractCutoutFromImage(file, fallbackUrl) {
     });
     return await trimTransparentCutout(URL.createObjectURL(blob));
   } catch (error) {
+    if (String(error?.message || "").includes("cutout")) throw error;
     return fallbackCutoutFromImage(fallbackUrl);
   }
 }
 
-function trimTransparentCutout(url) {
+async function reviewCutoutFromImage(file, fallbackUrl) {
+  try {
+    const { removeBackground } = await import("@imgly/background-removal");
+    const blob = await removeBackground(file, {
+      model: "isnet_fp16",
+      device: "cpu",
+      output: {
+        format: "image/png",
+        quality: 1,
+        type: "foreground",
+      },
+    });
+    return await trimTransparentCutout(URL.createObjectURL(blob), {
+      minSubjectRatio: 0.01,
+      maxSubjectRatio: 0.9,
+      maxLargeBoxRatio: 0.58,
+      minLargeBoxDensity: 0.3,
+      maxEdgeAlphaRatio: 0.62,
+      paddingRatio: 0.045,
+    });
+  } catch (error) {
+    if (String(error?.message || "").includes("cutout")) throw error;
+    return fallbackCutoutFromImage(fallbackUrl, {
+      minSubjectRatio: 0.012,
+      maxSubjectRatio: 0.88,
+      maxLargeBoxRatio: 0.6,
+      minLargeBoxDensity: 0.32,
+      paddingRatio: 0.055,
+    });
+  }
+}
+
+function trimTransparentCutout(url, options = {}) {
   return new Promise((resolve, reject) => {
+    const {
+      minSubjectRatio = 0.015,
+      maxSubjectRatio = 0.88,
+      maxLargeBoxRatio = 0.48,
+      minLargeBoxDensity = 0.38,
+      maxEdgeAlphaRatio = 0.5,
+      paddingRatio = 0.035,
+    } = options;
     const image = new Image();
     image.onload = () => {
       const source = document.createElement("canvas");
@@ -209,12 +251,32 @@ function trimTransparentCutout(url) {
       }
 
       const imageArea = width * height;
-      if (subjectCount < imageArea * 0.015 || subjectCount > imageArea * 0.88) {
+      if (subjectCount < imageArea * minSubjectRatio || subjectCount > imageArea * maxSubjectRatio) {
         reject(new Error("cutout review failed"));
         return;
       }
 
-      const padding = Math.round(Math.max(width, height) * 0.035);
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      const boxArea = boxW * boxH;
+      const boxRatio = boxArea / imageArea;
+      const alphaDensity = subjectCount / boxArea;
+      let edgeAlphaCount = 0;
+      const edgeBand = Math.max(4, Math.round(Math.min(boxW, boxH) * 0.045));
+      for (let y = minY; y <= maxY; y += 1) {
+        for (let x = minX; x <= maxX; x += 1) {
+          const nearEdge = x - minX < edgeBand || maxX - x < edgeBand || y - minY < edgeBand || maxY - y < edgeBand;
+          if (!nearEdge) continue;
+          if (data[(y * width + x) * 4 + 3] > 18) edgeAlphaCount += 1;
+        }
+      }
+      const edgeAlphaRatio = edgeAlphaCount / Math.max(1, boxArea - Math.max(0, boxW - edgeBand * 2) * Math.max(0, boxH - edgeBand * 2));
+      if ((boxRatio > maxLargeBoxRatio && alphaDensity < minLargeBoxDensity) || edgeAlphaRatio > maxEdgeAlphaRatio) {
+        reject(new Error("cutout background residue detected"));
+        return;
+      }
+
+      const padding = Math.round(Math.max(width, height) * paddingRatio);
       const cropX = Math.max(0, minX - padding);
       const cropY = Math.max(0, minY - padding);
       const cropW = Math.min(width - cropX, maxX - minX + 1 + padding * 2);
@@ -236,8 +298,15 @@ function trimTransparentCutout(url) {
   });
 }
 
-function fallbackCutoutFromImage(url) {
+function fallbackCutoutFromImage(url, options = {}) {
   return new Promise((resolve, reject) => {
+    const {
+      minSubjectRatio = 0.02,
+      maxSubjectRatio = 0.82,
+      maxLargeBoxRatio = 0.5,
+      minLargeBoxDensity = 0.42,
+      paddingRatio = 0.04,
+    } = options;
     const image = new Image();
     image.crossOrigin = "anonymous";
     image.onload = () => {
@@ -318,13 +387,24 @@ function fallbackCutoutFromImage(url) {
           subjectCount += 1;
         }
       }
-      if (subjectCount < width * height * 0.02) {
+      if (subjectCount < width * height * minSubjectRatio) {
         reject(new Error("cutout failed"));
         return;
       }
 
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      const boxArea = boxW * boxH;
+      const imageArea = width * height;
+      const boxRatio = boxArea / imageArea;
+      const alphaDensity = subjectCount / boxArea;
+      if (subjectCount > imageArea * maxSubjectRatio || (boxRatio > maxLargeBoxRatio && alphaDensity < minLargeBoxDensity)) {
+        reject(new Error("cutout background residue detected"));
+        return;
+      }
+
       context.putImageData(frame, 0, 0);
-      const padding = Math.round(Math.max(width, height) * 0.04);
+      const padding = Math.round(Math.max(width, height) * paddingRatio);
       const cropX = Math.max(0, minX - padding);
       const cropY = Math.max(0, minY - padding);
       const cropW = Math.min(width - cropX, maxX - minX + padding * 2);
@@ -399,6 +479,8 @@ function getWorkAssetStatus(work) {
   if (!work.uploaded) return "演示作品";
   if (work.cutoutStatus === "ready") return "原图已保留 · 抠图已生成";
   if (work.cutoutStatus === "processing") return "原图已保留 · 正在抠图";
+  if (work.cutoutStatus === "reviewing") return "原图已保留 · 二次复查中";
+  if (work.cutoutStatus === "manual") return "原图已保留 · 请重拍或手动裁剪";
   return "原图已保留 · 抠图待复查";
 }
 
@@ -411,9 +493,125 @@ function getWorkTraitRows(work) {
   ];
 }
 
+function loadPosterImage(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.onload = () => resolve(image);
+    image.onerror = reject;
+    image.src = src;
+  });
+}
+
+function roundRect(context, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.arcTo(x + width, y, x + width, y + height, r);
+  context.arcTo(x + width, y + height, x, y + height, r);
+  context.arcTo(x, y + height, x, y, r);
+  context.arcTo(x, y, x + width, y, r);
+  context.closePath();
+}
+
+function drawCoverImage(context, image, x, y, width, height) {
+  const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight);
+}
+
+function drawContainImage(context, image, x, y, width, height) {
+  const scale = Math.min(width / image.naturalWidth, height / image.naturalHeight);
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight);
+}
+
+async function createSharePoster(work) {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  const sceneImage = await loadPosterImage(work.scene);
+  const spiritImage = await loadPosterImage(needsCutoutReview(work) ? work.scene : work.cutout);
+
+  canvas.width = 1080;
+  canvas.height = 1440;
+
+  const background = context.createLinearGradient(0, 0, 0, canvas.height);
+  background.addColorStop(0, "#fff7df");
+  background.addColorStop(0.58, "#f1fbef");
+  background.addColorStop(1, "#ffffff");
+  context.fillStyle = background;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  context.save();
+  roundRect(context, 72, 72, 936, 540, 56);
+  context.clip();
+  drawCoverImage(context, sceneImage, 72, 72, 936, 540);
+  context.fillStyle = "rgba(255, 255, 255, 0.24)";
+  context.fillRect(72, 72, 936, 540);
+  context.restore();
+
+  context.save();
+  context.shadowColor = "rgba(47, 107, 79, 0.18)";
+  context.shadowBlur = 38;
+  context.shadowOffsetY = 20;
+  roundRect(context, 222, 420, 636, 430, 56);
+  context.fillStyle = "rgba(255, 255, 255, 0.84)";
+  context.fill();
+  context.restore();
+
+  drawContainImage(context, spiritImage, 260, 440, 560, 370);
+
+  context.fillStyle = "#171717";
+  context.font = '72px "ZCOOL KuaiLe", "Microsoft YaHei", sans-serif';
+  context.textAlign = "center";
+  context.fillText(work.name, 540, 960);
+
+  context.fillStyle = "#6f6a76";
+  context.font = '34px "Microsoft YaHei", sans-serif';
+  context.fillText(`Lv.${work.level} · ${work.form}`, 540, 1018);
+
+  context.save();
+  roundRect(context, 170, 1068, 740, 148, 42);
+  context.fillStyle = "#2f6b4f";
+  context.fill();
+  context.fillStyle = "#ffffff";
+  context.font = '42px "Microsoft YaHei", sans-serif';
+  context.fillText(`能量值 ${work.power.toLocaleString()}`, 540, 1130);
+  context.font = '28px "Microsoft YaHei", sans-serif';
+  context.fillText(`${work.rarity} · ${work.type} · ${work.pieces}颗拼豆`, 540, 1176);
+  context.restore();
+
+  context.fillStyle = "#8a8493";
+  context.font = '28px "Microsoft YaHei", sans-serif';
+  context.fillText(work.date, 540, 1276);
+
+  context.fillStyle = "#2f6b4f";
+  context.font = '34px "ZCOOL KuaiLe", "Microsoft YaHei", sans-serif';
+  context.fillText("BeanDex 拼豆图鉴", 540, 1352);
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("poster export failed"));
+        return;
+      }
+      resolve(blob);
+    }, "image/png", 0.95);
+  });
+}
+
 function needsCutoutReview(work) {
   if (work.uploaded) return work.cutoutStatus !== "ready";
   return pendingCutoutIds.has(work.id);
+}
+
+function getCutoutReviewLabel(work) {
+  if (work.cutoutStatus === "processing") return "正在抠图";
+  if (work.cutoutStatus === "reviewing") return "二次复查中";
+  if (work.cutoutStatus === "manual") return "请重拍或手动裁剪";
+  return "抠图待复查";
 }
 
 function getDayGroups(month, sourceWorks = works) {
@@ -776,7 +974,7 @@ function SpiritPanel({ currentIndex, onDetail, onEdit, onSelectWork, work, workL
               {needsCutoutReview(item) ? (
                 <div className="review-cutout">
                   <img alt={`${item.name} 原图预览`} src={item.scene} />
-                  <span>抠图待复查</span>
+                  <span>{getCutoutReviewLabel(item)}</span>
                 </div>
               ) : (
                 <PixiMeshSpirit
@@ -1256,15 +1454,59 @@ function App() {
       })
       .catch(() => {
         setUserWorks((current) => current.map((work) => (
-          work.id === nextWork.id ? { ...work, cutoutStatus: "review" } : work
+          work.id === nextWork.id ? { ...work, cutoutStatus: "reviewing" } : work
         )));
-        showNotice("抠图需要复查，先保留原图");
+        showNotice("正在二次复查抠图");
+        reviewCutoutFromImage(file, url)
+          .then((cutoutUrl) => {
+            objectUrlsRef.current.push(cutoutUrl);
+            setDraftUpload(cutoutUrl);
+            setUserWorks((current) => current.map((work) => (
+              work.id === nextWork.id
+                ? { ...work, cutout: cutoutUrl, thumb: cutoutUrl, cutoutStatus: "ready" }
+                : work
+            )));
+            showNotice("复查通过，豆灵已更新");
+          })
+          .catch(() => {
+            setUserWorks((current) => current.map((work) => (
+              work.id === nextWork.id ? { ...work, cutoutStatus: "manual" } : work
+            )));
+            showNotice("复查未通过，请重拍或手动裁剪");
+          });
       });
   };
   const showNotice = (message) => {
     setNotice(message);
     window.clearTimeout(noticeTimer.current);
     noticeTimer.current = window.setTimeout(() => setNotice(""), 1800);
+  };
+  const shareWork = async (work) => {
+    if (!work) return;
+    try {
+      showNotice("正在生成分享海报");
+      const poster = await createSharePoster(work);
+      const fileName = `BeanDex-${work.name}.png`;
+      const file = new File([poster], fileName, { type: "image/png" });
+      if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+        await navigator.share({
+          title: `${work.name} 的豆灵卡`,
+          text: `${work.name} · 能量值 ${work.power.toLocaleString()} · 来自 BeanDex 拼豆图鉴`,
+          files: [file],
+        });
+        showNotice("已打开分享面板");
+        return;
+      }
+      const url = URL.createObjectURL(poster);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+      showNotice("已保存分享海报");
+    } catch {
+      showNotice("分享海报生成失败");
+    }
   };
   useEffect(() => () => {
     window.clearTimeout(noticeTimer.current);
@@ -1370,7 +1612,13 @@ function App() {
                 <h2>{detailWork.name}</h2>
                 <p>Lv.{detailWork.level} · {detailWork.rarity}</p>
               </div>
-              <button aria-label="关闭详情" onClick={closeDetail} type="button">关闭</button>
+              <div className="detail-actions">
+                <button aria-label={`分享 ${detailWork.name}`} onClick={() => shareWork(detailWork)} type="button">
+                  <Share2 size={16} />
+                  分享
+                </button>
+                <button aria-label="关闭详情" onClick={closeDetail} type="button">关闭</button>
+              </div>
             </div>
             <strong>能量值 {detailWork.power.toLocaleString()}</strong>
             <p className="asset-status">{getWorkAssetStatus(detailWork)}</p>
